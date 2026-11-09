@@ -1,36 +1,35 @@
 # rk-pcie-sdk v0.1.0
 
-RK3588 / Linux 6.1 FPGA PCIe access driver, Phase 1.
+RK3588 host driver for the Rockchip PCIe endpoint `1d87:356a`.
 
-## 1. Phase 1 scope
+## 1. Scope
 
-Implemented:
+Implemented, for the Rockchip endpoint `1d87:356a` (BAR0 4MB control, BAR2 64MB window, BAR4 1MB DMA):
 
-- PCI driver probe/remove
-- Explicit dynamic PCI ID binding through `new_id`
-- PCI memory BAR resource request and mapping
-- `/dev/rk-pcieN` character device
-- `ioctl`: device information, BAR 32-bit read/write
-- Basic user-space test utility
+- PCI probe/remove and the static ID `1d87:356a`
+- misc device `/dev/pcie-rkep-<BDF>`
+- one ioctl ABI, `include/rk_pcie_uapi.h` (the old magic-`R` diagnostic header is retired)
+- device information, plus 32-bit BAR read/write
+- coherent DMA buffer alloc, mmap, and blocking single-direction H2C/C2H on channel 0 or 1
+- DMA completion by status poll, with a 1 second MSI wait when requested
+- user interrupts by virtual id
 
-Not implemented yet:
+Not in this driver:
 
-- XDMA H2C/C2H engine programming
-- DMA buffer allocation and mmap
-- MSI/MSI-X event delivery
-- Async transfer queues
-- Performance benchmark
+- Xilinx XDMA
+- more than two DMA channels
+- a userspace library above the ioctl ABI
 
-Do not treat this phase as a working XDMA DMA driver. XDMA register layout, channel count,
-interrupt mode, descriptor format and IP version must be confirmed from the FPGA build.
+DMA controller interrupts stay masked until userspace selects MSI completion.
+Channel 0 and channel 1 each have their own engine mutex, held across the transfer.
 
 ## 2. Requirements
 
 - RK3588 running Linux 6.1
 - Kernel build tree prepared for the exact running kernel
 - `CONFIG_PCI=y`
-- `CONFIG_PCI_MSI` is recommended for later phases
-- PCIe FPGA endpoint enumerates successfully
+- `CONFIG_PCI_MSI=y` (probe requests MSI vectors; DMA completion still polls unless asked)
+- Rockchip endpoint `1d87:356a` enumerates successfully
 - Root privileges for driver binding and BAR writes
 
 ## 3. Build kernel module
@@ -58,37 +57,23 @@ version running on the board. If the kernel uses a separate `O=` output director
 ## 4. Load driver
 
 ```bash
-sudo insmod kernel/rk_pcie_drv.ko
+sudo insmod kernel/pcie-rkep.ko
 dmesg | tail -n 50
 ```
 
-The driver intentionally uses an empty static PCI ID table to avoid binding unrelated
-devices. Add the actual FPGA IDs dynamically.
-
-Example only (replace with the IDs reported by `lspci -nn`):
+`1d87:356a` is in the driver's ID table and binds on insert. For any other ID:
 
 ```bash
-sudo sh -c 'echo 10ee 903f > /sys/bus/pci/drivers/rk-pcie-sdk/new_id'
+sudo ./scripts/bind_device.sh 1d87 356a
 ```
-
-If the device is already bound to another driver, unbind it first. Do not unbind a production
-device without understanding the impact.
 
 Check:
 
 ```bash
-lspci -nnk
-ls -l /dev/rk-pcie*
+lspci -nnk -s 03:00.0
+ls -l /dev/pcie-rkep*
 dmesg | tail -n 100
 ```
-
-You can also use:
-
-```bash
-sudo ./scripts/bind_device.sh 10ee 903f
-```
-
-The script assumes the device is not already bound to another driver.
 
 ## 5. Build and run user test
 
@@ -97,26 +82,45 @@ cd user
 make
 ```
 
-Device information:
+The safe BAR check reads the object version register and compares it with `GET_INFO`.
+On this card that register is BAR0 offset `0x4` (magic is offset `0x0`, value `0x524b4550`).
 
 ```bash
-sudo ./pcie_test info /dev/rk-pcie0
+sudo ./pcie_test info /dev/pcie-rkep-0000:03:00.0
+sudo ./pcie_test read /dev/pcie-rkep-0000:03:00.0 0 0x4
 ```
 
-Read BAR0 register at offset 0:
+BAR0 bytes below `0x400` and BAR4 (the DMA registers) are not writable. A write there
+returns `EPERM`.
 
 ```bash
-sudo ./pcie_test read /dev/rk-pcie0 0 0x0
+sudo ./pcie_test write /dev/pcie-rkep-0000:03:00.0 2 0x0 0x1
 ```
 
-Write BAR0 register:
+Blocking DMA uses a coherent buffer. `EP_ADDR` is an endpoint address in spare memory,
+not the host BAR address. Channel defaults to 0. Polling is the default; MSI is opt-in
+and depends on the endpoint forwarding DMA done.
 
 ```bash
-sudo ./pcie_test write /dev/rk-pcie0 0 0x8 0x1
+sudo ./pcie_test h2c /dev/pcie-rkep-0000:03:00.0 EP_ADDR 0x1000
+sudo ./pcie_test c2h /dev/pcie-rkep-0000:03:00.0 EP_ADDR 0x1000
+sudo ./pcie_test loop /dev/pcie-rkep-0000:03:00.0 EP_ADDR 0x1000
+sudo ./pcie_test dma-mode /dev/pcie-rkep-0000:03:00.0 msi
+sudo ./pcie_test dma-mode /dev/pcie-rkep-0000:03:00.0 poll
 ```
 
-WARNING: BAR writes can change FPGA state. Only write offsets documented by the FPGA
-hardware design. Do not write arbitrary offsets.
+Replace `EP_ADDR` with an endpoint address from the firmware memory map. It is not the host BAR2 address (`0x3ffe0000000` on the enumerated card).
+
+`loop` writes the endpoint buffer. Do not point it at firmware.
+
+User interrupts keep the virtual-id wait. `irq-wait` returns when the endpoint raises
+that id, or when the timeout expires.
+
+```bash
+sudo ./pcie_test irq-alloc /dev/pcie-rkep-0000:03:00.0
+sudo ./pcie_test irq-wait /dev/pcie-rkep-0000:03:00.0 1 1000
+sudo ./pcie_test irq-free /dev/pcie-rkep-0000:03:00.0 1
+```
 
 ## 6. Link status
 
@@ -138,24 +142,23 @@ lspci -s <BDF> -vv | grep -E 'LnkCap|LnkSta'
 ## 7. Unload
 
 ```bash
-sudo rmmod rk_pcie_drv
+sudo rmmod pcie-rkep
 ```
 
 ## 8. Important engineering notes
 
-1. This driver is a generic PCIe BAR access skeleton, not the vendor XDMA Linux driver.
-2. The actual Xilinx XDMA PCI Vendor/Device IDs vary with the FPGA PCIe IP configuration.
-   Do not assume `10ee:903f`; obtain the real values from `lspci -nn`.
-3. Before integrating this driver with XDMA, inspect whether the vendor XDMA driver is already
-   bound. Two drivers cannot own the same PCI function simultaneously.
-4. BAR register reads/writes are serialized by a mutex. This is appropriate for Phase 1
-   diagnostics, not high-throughput data paths.
-5. No DMA bus mastering is enabled in this phase.
-6. Do not map a BAR as normal cached memory. Use proper I/O accessors.
-7. Before Phase 2, confirm the XDMA IP version, BAR map, H2C/C2H channel count, descriptor
-   mode, interrupt mode, FPGA DMA address width, and RK3588 IOMMU/SMMU behavior.
-8. The kernel module should be tested first with a harmless read-only FPGA ID/version
-   register. Avoid testing writes until the register map is confirmed.
+1. The public ABI is `include/rk_pcie_uapi.h`. `include/rk_pcie_ioctl.h` only includes it.
+2. `1d87:356a` matches the ID table. Confirm with `lspci -nn` before binding anything else.
+3. Two drivers cannot own the same PCI function.
+4. BAR reads and writes are serialized. BAR4 is not writable from userspace; the kernel
+   owns the DMA doorbell.
+5. DMA defaults to masked interrupts and status polling, with its own timeout. `dma-mode msi`
+   unmasks the controller and waits up to one second for the endpoint to forward completion.
+6. Host DMA addresses must come from `PCIE_EP_CONTINUOUS_BUFFER_ALLOC` on the same fd.
+7. Do not map a BAR as normal cached memory. Coherent DMA buffers are mapped with
+   `dma_mmap_coherent`.
+8. Start with `pcie_test info`. It reads the BAR0 version register and fails if that read
+   disagrees with `GET_INFO`.
 
 ## 9. Troubleshooting
 

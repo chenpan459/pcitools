@@ -3,13 +3,13 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "Usage: $0 VENDOR_ID DEVICE_ID"
-    echo "Example: $0 10ee 903f"
+    echo "Example: $0 1d87 356a"
     exit 2
 fi
 
 VID="$1"
 DID="$2"
-DRIVER="rk-pcie-sdk"
+DRIVER="pcie-rkep"
 BDF=""
 
 for f in /sys/bus/pci/devices/*; do

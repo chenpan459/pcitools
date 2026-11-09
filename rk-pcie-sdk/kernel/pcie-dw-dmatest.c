@@ -165,6 +165,26 @@ err_out:
 	return ret;
 }
 
+static int rk_pcie_dma_wait_irq(struct dma_trx_obj *obj, struct dma_table *table,
+				struct completion *done)
+{
+	int ret;
+
+	ret = wait_for_completion_interruptible_timeout(done, HZ);
+	if (ret > 0)
+		return 0;
+	if (ret == 0) {
+		dev_err(obj->dev, "dma irq wait timed out, chn=%u dir=%u size=%zu\n",
+			table->chn, table->dir, table->buf_size);
+		if (obj->dma_debug)
+			obj->dma_debug(obj, table);
+		return -ETIMEDOUT;
+	}
+
+	dev_err(obj->dev, "dma irq wait interrupted, chn=%u\n", table->chn);
+	return ret;
+}
+
 static int rk_pcie_local_dma_frombus_block(struct dma_trx_obj *obj, u32 chn,
 					   u64 local_paddr, u64 bus_paddr, u32 size)
 {
@@ -192,17 +212,10 @@ static int rk_pcie_local_dma_frombus_block(struct dma_trx_obj *obj, u32 chn,
 	obj->config_dma_func(table);
 	obj->start_dma_func(obj, table);
 
-	if (dmatest_dev->rd_irq_en) {
-		ret = wait_for_completion_interruptible_timeout(&dmatest_dev->rd_done[chn], HZ);
-		if (ret < 0)
-			dev_err(obj->dev, "%s interrupted\n", __func__);
-		else if (ret == 0)
-			dev_err(obj->dev, "%s timed out\n", __func__);
-		else
-			ret = 0;
-	} else {
+	if (dmatest_dev->rd_irq_en)
+		ret = rk_pcie_dma_wait_irq(obj, table, &dmatest_dev->rd_done[chn]);
+	else
 		ret = rk_pcie_dma_wait_for_finished(obj, table);
-	}
 	mutex_unlock(&dmatest_dev->rd_lock[chn]);
 
 	return ret;
@@ -235,17 +248,10 @@ static int rk_pcie_local_dma_tobus_block(struct dma_trx_obj *obj, u32 chn,
 	obj->config_dma_func(table);
 	obj->start_dma_func(obj, table);
 
-	if (dmatest_dev->wr_irq_en) {
-		ret = wait_for_completion_interruptible_timeout(&dmatest_dev->wr_done[chn], HZ);
-		if (ret < 0)
-			dev_err(obj->dev, "%s interrupted\n", __func__);
-		else if (ret == 0)
-			dev_err(obj->dev, "%s timed out\n", __func__);
-		else
-			ret = 0;
-	} else {
+	if (dmatest_dev->wr_irq_en)
+		ret = rk_pcie_dma_wait_irq(obj, table, &dmatest_dev->wr_done[chn]);
+	else
 		ret = rk_pcie_dma_wait_for_finished(obj, table);
-	}
 	mutex_unlock(&dmatest_dev->wr_lock[chn]);
 
 	return ret;

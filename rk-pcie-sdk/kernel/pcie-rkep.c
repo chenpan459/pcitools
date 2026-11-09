@@ -21,6 +21,7 @@
 #include <linux/of.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 
 #include "rk-pcie-ep.h"
 #ifdef CONFIG_PCIEASPM_EXT
@@ -127,6 +128,8 @@ struct pcie_rkep {
 	struct pcie_ep_obj_info *obj_info;
 	struct page *user_pages; /* Allocated physical memory for user space */
 	struct mutex dev_lock_mutex; /* Sync resources in multi-process, such as vid and ELBI0 */
+	struct mutex bar_mutex; /* Serializes diagnostic BAR reads and writes */
+	u8 dma_msi; /* 0: poll DMA status, interrupts masked. 1: wait for MSI */
 	DECLARE_BITMAP(virtual_id_bitmap, RKEP_EP_VIRTUAL_ID_MAX);
 	DECLARE_BITMAP(virtual_id_irq_bitmap, RKEP_EP_VIRTUAL_ID_MAX);
 	wait_queue_head_t wq_head;
@@ -242,15 +245,69 @@ static int pcie_rkep_get_pci_link_data(struct pcie_rkep *pcie_rkep, u16 link_sta
 	return 0;
 }
 
-static int rkep_ep_dma_xfer(struct pcie_rkep *pcie_rkep, struct pcie_ep_dma_block_req *dma)
+/* Caller holds pcie_file->file_lock_mutex. */
+static int rkep_host_dma_range_ok(struct pcie_file *pcie_file, u64 addr, u32 size)
 {
+	struct pcie_ep_continuous_buffer_req *buf;
+	struct pcie_rkep *dev = pcie_file->pcie_rkep;
+	u64 end;
+
+	if (!size || size > (~(u64)0) - addr)
+		return -EINVAL;
+	end = addr + size;
+
+	if (dev->user_pages) {
+		u64 base = page_to_phys(dev->user_pages);
+
+		if (addr >= base && end <= base + RKEP_USER_MEM_SIZE)
+			return 0;
+	}
+
+	list_for_each_entry(buf, &pcie_file->cont_buffer_list, cont_buffer_list) {
+		if (addr >= buf->dma_addr && end <= buf->dma_addr + buf->size)
+			return 0;
+	}
+
+	dev_err(&dev->pdev->dev,
+		"dma local 0x%llx size 0x%x is not a buffer owned by this fd\n",
+		addr, size);
+	return -EINVAL;
+}
+
+static int rkep_ep_dma_xfer(struct pcie_file *pcie_file, struct pcie_ep_dma_block_req *dma)
+{
+	struct pcie_rkep *pcie_rkep = pcie_file->pcie_rkep;
 	int ret;
 
-	if (dma->wr)
-		ret = pcie_dw_wired_dma_tobus_block(pcie_rkep->dma_obj, dma->chn, dma->block.bus_paddr, dma->block.local_paddr, dma->block.size);
-	else
-		ret = pcie_dw_wired_dma_frombus_block(pcie_rkep->dma_obj, dma->chn, dma->block.local_paddr, dma->block.bus_paddr, dma->block.size);
+	if (dma->chn >= PCIE_DMA_CHANEL_MAX_NUM)
+		return -EINVAL;
+	if (!pcie_rkep->dma_obj)
+		return -ENODEV;
 
+	mutex_lock(&pcie_file->file_lock_mutex);
+	ret = rkep_host_dma_range_ok(pcie_file, dma->block.local_paddr, dma->block.size);
+	if (!ret) {
+		/*
+		 * wr=1 programs the DMA read engine: host buffer -> endpoint.
+		 * wr=0 programs the DMA write engine: endpoint -> host buffer.
+		 * The per-engine channel mutex is held inside the transfer,
+		 * including the poll or MSI wait.
+		 */
+		if (dma->wr)
+			ret = pcie_dw_wired_dma_tobus_block(pcie_rkep->dma_obj, dma->chn,
+							    dma->block.bus_paddr,
+							    dma->block.local_paddr,
+							    dma->block.size);
+		else
+			ret = pcie_dw_wired_dma_frombus_block(pcie_rkep->dma_obj, dma->chn,
+							      dma->block.local_paddr,
+							      dma->block.bus_paddr,
+							      dma->block.size);
+	}
+	mutex_unlock(&pcie_file->file_lock_mutex);
+
+	if (ret == -1)
+		return -EIO;
 	return ret;
 }
 
@@ -361,6 +418,7 @@ static int rkep_ep_poll_irq_user(struct pcie_file *pcie_file, struct pcie_ep_obj
 {
 	struct pcie_rkep *pcie_rkep = pcie_file->pcie_rkep;
 	u32 index = cfg->virtual_id;
+	long ret;
 
 	if (index >= RKEP_EP_VIRTUAL_ID_MAX) {
 		dev_err(&pcie_rkep->pdev->dev, "poll irq_user, virtual id %d out of range\n", index);
@@ -370,13 +428,15 @@ static int rkep_ep_poll_irq_user(struct pcie_file *pcie_file, struct pcie_ep_obj
 
 	cfg->poll_status = NSIGPOLL;
 	if (cfg->sync) {
-		wait_event_interruptible(pcie_rkep->wq_head,
-					 test_bit(index, pcie_rkep->virtual_id_irq_bitmap));
+		ret = wait_event_interruptible(pcie_rkep->wq_head,
+					       test_bit(index, pcie_rkep->virtual_id_irq_bitmap));
 	} else {
-		wait_event_interruptible_timeout(pcie_rkep->wq_head,
-						 test_bit(index, pcie_rkep->virtual_id_irq_bitmap),
-						 cfg->timeout_ms);
+		ret = wait_event_interruptible_timeout(pcie_rkep->wq_head,
+						       test_bit(index, pcie_rkep->virtual_id_irq_bitmap),
+						       msecs_to_jiffies(cfg->timeout_ms));
 	}
+	if (ret < 0)
+		return ret;
 	if (test_and_clear_bit(index, pcie_rkep->virtual_id_irq_bitmap))
 		cfg->poll_status = POLL_IN;
 
@@ -420,6 +480,9 @@ static int rkep_mem_continuous_buffer_alloc(struct pcie_file *pcie_file,
 	dma_addr_t dma_addr;
 	void *vir_addr;
 	int ret = 0;
+
+	if (!param->size)
+		return -EINVAL;
 
 	mutex_lock(&pcie_file->file_lock_mutex);
 
@@ -810,6 +873,126 @@ static int pcie_rkep_mmap(struct file *file, struct vm_area_struct *vma)
 	return 0;
 }
 
+static void __iomem *rkep_bar_base(struct pcie_rkep *dev, u32 bar, resource_size_t *len)
+{
+	*len = 0;
+	switch (bar) {
+	case RK_PCIE_BAR_CTRL:
+		*len = pci_resource_len(dev->pdev, 0);
+		return dev->bar0;
+	case RK_PCIE_BAR_MEM:
+		*len = pci_resource_len(dev->pdev, 2);
+		return dev->bar2;
+	case RK_PCIE_BAR_DMA:
+		*len = pci_resource_len(dev->pdev, 4);
+		return dev->bar4;
+	default:
+		return NULL;
+	}
+}
+
+static int rkep_bar_rw(struct pcie_rkep *dev, struct rk_pcie_ioc_bar *req, bool write)
+{
+	void __iomem *base;
+	resource_size_t len;
+
+	if (req->offset & 3)
+		return -EINVAL;
+	if (write && (req->bar == RK_PCIE_BAR_DMA ||
+		      (req->bar == RK_PCIE_BAR_CTRL && req->offset < RK_PCIE_OBJ_INFO_SIZE)))
+		return -EPERM;
+
+	base = rkep_bar_base(dev, req->bar, &len);
+	if (!base || (resource_size_t)req->offset > len || len - req->offset < 4)
+		return -EINVAL;
+
+	mutex_lock(&dev->bar_mutex);
+	if (write)
+		writel(req->value, base + req->offset);
+	else
+		req->value = readl(base + req->offset);
+	mutex_unlock(&dev->bar_mutex);
+	return 0;
+}
+
+static void rkep_fill_info(struct pcie_rkep *dev, struct rk_pcie_ioc_info *info)
+{
+	struct pci_dev *pdev = dev->pdev;
+	u16 link = 0, devsta = 0;
+	unsigned int i;
+
+	memset(info, 0, sizeof(*info));
+	info->abi_version = RK_PCIE_ABI_VERSION;
+	info->drv_version = DRV_VERSION;
+	info->vendor_id = pdev->vendor;
+	info->device_id = pdev->device;
+	info->subsystem_vendor_id = pdev->subsystem_vendor;
+	info->subsystem_device_id = pdev->subsystem_device;
+	info->domain = pci_domain_nr(pdev->bus);
+	info->bus = pdev->bus->number;
+	info->dev = PCI_SLOT(pdev->devfn);
+	info->func = PCI_FUNC(pdev->devfn);
+	info->revision = pdev->revision;
+
+	pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &link);
+	info->link_speed = link & PCI_EXP_LNKSTA_CLS;
+	info->link_width = (link & PCI_EXP_LNKSTA_NLW) >> 4;
+	pcie_capability_read_word(pdev, PCI_EXP_DEVSTA, &devsta);
+	info->devsta = devsta;
+	info->msi_vectors = dev->irq_valid;
+	info->dma_completion = dev->dma_msi ? RK_PCIE_DMA_MSI : RK_PCIE_DMA_POLL;
+	info->dma_channels = PCIE_DMA_CHANEL_MAX_NUM;
+
+	if (dev->bar0 && dev->obj_info) {
+		info->obj_off = (u32)((unsigned long)dev->obj_info -
+				      (unsigned long)dev->bar0);
+		mutex_lock(&dev->bar_mutex);
+		info->obj_magic = readl((u8 __iomem *)dev->obj_info + RK_PCIE_OBJ_MAGIC_OFF);
+		info->obj_version = readl((u8 __iomem *)dev->obj_info + RK_PCIE_OBJ_VERSION_OFF);
+		mutex_unlock(&dev->bar_mutex);
+	}
+
+	for (i = 0; i < RK_PCIE_MAX_BARS; i++) {
+		info->bar_start[i] = pci_resource_start(pdev, i);
+		info->bar_length[i] = pci_resource_len(pdev, i);
+		info->bar_flags[i] = (u32)pci_resource_flags(pdev, i);
+	}
+}
+
+static int rkep_set_dma_completion(struct pcie_rkep *dev, u32 mode)
+{
+	if (mode != RK_PCIE_DMA_POLL && mode != RK_PCIE_DMA_MSI)
+		return -EINVAL;
+	if (!dev->dma_obj || !dev->obj_info)
+		return -ENODEV;
+
+	mutex_lock(&dev->dev_lock_mutex);
+	if (mode == RK_PCIE_DMA_MSI) {
+		dev->obj_info->irq_rc_msi_en = 1;
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_WR_INT_CLEAR, 0x00ff00ff);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_RD_INT_CLEAR, 0x00ff00ff);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_WR_INT_MASK, 0x0);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_RD_INT_MASK, 0x0);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_WR_LL_ERR_EN, 0x0);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_RD_LL_ERR_EN, 0x0);
+		pcie_dw_dmatest_irq_en(dev->dma_obj, true, true);
+		dev->dma_msi = 1;
+	} else {
+		pcie_dw_dmatest_irq_en(dev->dma_obj, false, false);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_WR_INT_MASK, 0xffffffff);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_RD_INT_MASK, 0xffffffff);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_WR_LL_ERR_EN, 0xffffffff);
+		pcie_rkep_writel_dbi(dev, PCIE_DMA_OFFSET + PCIE_DMA_RD_LL_ERR_EN, 0xffffffff);
+		dev->obj_info->irq_rc_msi_en = 0;
+		dev->dma_msi = 0;
+	}
+	mutex_unlock(&dev->dev_lock_mutex);
+
+	dev_info(&dev->pdev->dev, "dma completion %s\n",
+		 dev->dma_msi ? "msi" : "poll");
+	return 0;
+}
+
 static long pcie_rkep_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 {
 	struct pcie_file *pcie_file = file->private_data;
@@ -863,12 +1046,7 @@ static long pcie_rkep_ioctl(struct file *file, unsigned int cmd, unsigned long a
 				"failed to get dma_data copy from userspace\n");
 			return -EFAULT;
 		}
-		ret = rkep_ep_dma_xfer(pcie_rkep, &dma);
-		if (ret) {
-			dev_err(&pcie_rkep->pdev->dev, "failed to transfer dma, ret=%d\n", ret);
-			return -EFAULT;
-		}
-		break;
+		return rkep_ep_dma_xfer(pcie_file, &dma);
 	case PCIE_EP_DMA_MSI_DETECT:
 		/*
 		 * Enabling the corresponding interrupt via EP will enable the corresponding MSI
@@ -877,17 +1055,17 @@ static long pcie_rkep_ioctl(struct file *file, unsigned int cmd, unsigned long a
 		wr_mask = pcie_rkep_readl_dbi(pcie_rkep, PCIE_DMA_OFFSET + PCIE_DMA_WR_INT_MASK);
 		rd_mask = pcie_rkep_readl_dbi(pcie_rkep, PCIE_DMA_OFFSET + PCIE_DMA_RD_INT_MASK);
 		pcie_dw_dmatest_irq_en(pcie_rkep->dma_obj, !wr_mask, !rd_mask);
-		if (!wr_mask && !rd_mask)
+		if (!wr_mask && !rd_mask) {
 			pcie_rkep->obj_info->irq_rc_msi_en = 1;
+			pcie_rkep->dma_msi = 1;
+		} else {
+			pcie_rkep->dma_msi = 0;
+		}
 		break;
 	case PCIE_EP_REQUEST_VIRTUAL_ID:
 		index = rkep_ep_request_virtual_id(pcie_file);
-		if (index < 0) {
-			dev_err(&pcie_rkep->pdev->dev,
-				"request virtual id failed, ret=%d\n", index);
-
-			return -EFAULT;
-		}
+		if (index < 0)
+			return index;
 		if (copy_to_user(uarg, &index, sizeof(index)))
 			return -EFAULT;
 		break;
@@ -929,7 +1107,7 @@ static long pcie_rkep_ioctl(struct file *file, unsigned int cmd, unsigned long a
 
 		ret = rkep_ep_poll_irq_user(pcie_file, &poll_cfg);
 		if (ret < 0)
-			return -EFAULT;
+			return ret;
 
 		if (copy_to_user(uarg, &poll_cfg, sizeof(poll_cfg)))
 			return -EFAULT;
@@ -1022,8 +1200,38 @@ static long pcie_rkep_ioctl(struct file *file, unsigned int cmd, unsigned long a
 		pcie_file->cur_mmap_res = PCIE_EP_MMAP_RESOURCE_CONTINUOUS_BUFFER;
 		pcie_file->cur_mmap_addr = cont_buf_pram.dma_addr;
 		break;
-	default:
+	case RK_PCIE_IOC_GET_INFO: {
+		struct rk_pcie_ioc_info info;
+
+		rkep_fill_info(pcie_rkep, &info);
+		if (copy_to_user(uarg, &info, sizeof(info)))
+			return -EFAULT;
 		break;
+	}
+	case RK_PCIE_IOC_BAR_READ:
+	case RK_PCIE_IOC_BAR_WRITE: {
+		struct rk_pcie_ioc_bar bar;
+		int bar_ret;
+
+		if (copy_from_user(&bar, uarg, sizeof(bar)))
+			return -EFAULT;
+		bar_ret = rkep_bar_rw(pcie_rkep, &bar, cmd == RK_PCIE_IOC_BAR_WRITE);
+		if (bar_ret)
+			return bar_ret;
+		if (cmd == RK_PCIE_IOC_BAR_READ &&
+		    copy_to_user(uarg, &bar, sizeof(bar)))
+			return -EFAULT;
+		break;
+	}
+	case RK_PCIE_IOC_DMA_COMPLETION: {
+		u32 mode;
+
+		if (copy_from_user(&mode, uarg, sizeof(mode)))
+			return -EFAULT;
+		return rkep_set_dma_completion(pcie_rkep, mode);
+	}
+	default:
+		return -ENOTTY;
 	}
 
 	return 0;
@@ -1553,6 +1761,7 @@ static int pcie_rkep_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pcie_rkep->dev.parent = NULL;
 
 	mutex_init(&pcie_rkep->dev_lock_mutex);
+	mutex_init(&pcie_rkep->bar_mutex);
 
 	ret = misc_register(&pcie_rkep->dev);
 	if (ret) {

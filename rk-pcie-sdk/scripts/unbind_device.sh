@@ -8,4 +8,4 @@ if [ "$#" -ne 1 ]; then
 fi
 
 BDF="$1"
-echo "$BDF" > /sys/bus/pci/drivers/rk-pcie-sdk/unbind
+echo "$BDF" > /sys/bus/pci/drivers/pcie-rkep/unbind

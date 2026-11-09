@@ -1,13 +1,7 @@
-obj-m += rk_pcie_drv.o
-
-KDIR ?= /lib/modules/$(shell uname -r)/build
-ARCH ?= arm64
-CROSS_COMPILE ?=
-
-.PHONY: all clean
-
-all:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
-
+obj-m:=pcie-rkep.o
+KERNELDIR:=/usr/src/linux-headers-`uname -r`/
+PWD :=$(shell pwd)
+modules:
+	$(MAKE)  -C  $(KERNELDIR)  M=$(PWD)  modules
 clean:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) clean
+	rm -rf *o *.mod.c *.order *.symvers *.mod
